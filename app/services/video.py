@@ -2,6 +2,8 @@ import glob
 import os
 import random
 from typing import List
+import tempfile
+import subprocess
 
 from loguru import logger
 from moviepy import (
@@ -17,6 +19,7 @@ from moviepy import (
 )
 from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import ImageFont
+import psutil
 
 from app.models import const
 from app.models.schema import (
@@ -46,6 +49,12 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
     return ""
 
 
+def log_memory_usage(tag=""):
+    process = psutil.Process(os.getpid())
+    mem = process.memory_info().rss / 1024 / 1024  # MB
+    logger.info(f"[{tag}] Memory usage: {mem:.2f} MB")
+
+
 def combine_videos(
     combined_video_path: str,
     video_paths: List[str],
@@ -56,11 +65,10 @@ def combine_videos(
     max_clip_duration: int = 5,
     threads: int = 2,
 ) -> str:
+    log_memory_usage("start_combine_videos")
     audio_clip = AudioFileClip(audio_file)
     audio_duration = audio_clip.duration
     logger.info(f"max duration of audio: {audio_duration} seconds")
-    # Required duration of each clip
-    req_dur = audio_duration / len(video_paths)
     req_dur = max_clip_duration
     logger.info(f"each clip will be maximum {req_dur} seconds long")
     output_dir = os.path.dirname(combined_video_path)
@@ -68,75 +76,53 @@ def combine_videos(
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
 
-    clips = []
     video_duration = 0
-
     raw_clips = []
     for video_path in video_paths:
         clip = VideoFileClip(video_path).without_audio()
         clip_duration = clip.duration
         start_time = 0
-
         while start_time < clip_duration:
             end_time = min(start_time + max_clip_duration, clip_duration)
             split_clip = clip.subclipped(start_time, end_time)
             raw_clips.append(split_clip)
-            # logger.info(f"splitting from {start_time:.2f} to {end_time:.2f}, clip duration {clip_duration:.2f}, split_clip duration {split_clip.duration:.2f}")
             start_time = end_time
             if video_concat_mode.value == VideoConcatMode.sequential.value:
                 break
-
-    # random video_paths order
+        clip.close()
+        del clip
+        log_memory_usage(f"after_split_{video_path}")
     if video_concat_mode.value == VideoConcatMode.random.value:
         random.shuffle(raw_clips)
 
-    # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
+    temp_files = []
     while video_duration < audio_duration:
-        for clip in raw_clips:
-            # Check if clip is longer than the remaining audio
+        for idx, clip in enumerate(raw_clips):
             if (audio_duration - video_duration) < clip.duration:
                 clip = clip.subclipped(0, (audio_duration - video_duration))
-            # Only shorten clips if the calculated clip length (req_dur) is shorter than the actual clip to prevent still image
             elif req_dur < clip.duration:
                 clip = clip.subclipped(0, req_dur)
             clip = clip.with_fps(30)
-
-            # Not all videos are same size, so we need to resize them
             clip_w, clip_h = clip.size
             if clip_w != video_width or clip_h != video_height:
                 clip_ratio = clip.w / clip.h
                 video_ratio = video_width / video_height
-
                 if clip_ratio == video_ratio:
-                    # Resize proportionally
                     clip = clip.resized((video_width, video_height))
                 else:
-                    # Resize proportionally
                     if clip_ratio > video_ratio:
-                        # Resize proportionally based on the target width
                         scale_factor = video_width / clip_w
                     else:
-                        # Resize proportionally based on the target height
                         scale_factor = video_height / clip_h
-
                     new_width = int(clip_w * scale_factor)
                     new_height = int(clip_h * scale_factor)
                     clip_resized = clip.resized(new_size=(new_width, new_height))
-
-                    background = ColorClip(
-                        size=(video_width, video_height), color=(0, 0, 0)
-                    )
-                    clip = CompositeVideoClip(
-                        [
-                            background.with_duration(clip.duration),
-                            clip_resized.with_position("center"),
-                        ]
-                    )
-
-                logger.info(
-                    f"resizing video to {video_width} x {video_height}, clip size: {clip_w} x {clip_h}"
-                )
-
+                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0))
+                    clip = CompositeVideoClip([
+                        background.with_duration(clip.duration),
+                        clip_resized.with_position("center"),
+                    ])
+                logger.info(f"resizing video to {video_width} x {video_height}, clip size: {clip_w} x {clip_h}")
             shuffle_side = random.choice(["left", "right", "top", "bottom"])
             if video_transition_mode.value == VideoTransitionMode.none.value:
                 clip = clip
@@ -157,26 +143,41 @@ def combine_videos(
                 ]
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
-
             if clip.duration > max_clip_duration:
                 clip = clip.subclipped(0, max_clip_duration)
-
-            clips.append(clip)
-            video_duration += clip.duration
-    clips = [CompositeVideoClip([clip]) for clip in clips]
-    video_clip = concatenate_videoclips(clips)
-    video_clip = video_clip.with_fps(30)
-    logger.info("writing")
-    # https://github.com/harry0703/MoneyPrinterTurbo/issues/111#issuecomment-2032354030
-    video_clip.write_videofile(
-        filename=combined_video_path,
-        threads=threads,
-        logger=None,
-        temp_audiofile_path=output_dir,
-        audio_codec="aac",
-        fps=30,
-    )
-    video_clip.close()
+            # 直接寫成臨時 mp4
+            temp_path = os.path.join(tempfile.gettempdir(), f"combine_part_{len(temp_files)}.mp4")
+            clip.write_videofile(temp_path, fps=30, logger=None)
+            clip.close()
+            del clip
+            temp_files.append(temp_path)
+            video_duration += min(req_dur, audio_duration - video_duration)
+            log_memory_usage(f"after_write_temp_{video_duration:.2f}s")
+            if video_duration >= audio_duration:
+                break
+    # 產生 concat.txt
+    concat_txt_path = os.path.join(tempfile.gettempdir(), "combine_concat.txt")
+    with open(concat_txt_path, "w") as f:
+        for temp_path in temp_files:
+            f.write(f"file '{temp_path}'\n")
+    log_memory_usage("before_ffmpeg_concat")
+    # ffmpeg concat
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", concat_txt_path,
+        "-c", "copy", combined_video_path
+    ], check=True)
+    log_memory_usage("after_ffmpeg_concat")
+    # 清理臨時檔案
+    for temp_path in temp_files:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+    try:
+        os.remove(concat_txt_path)
+    except Exception:
+        pass
     logger.success("completed")
     return combined_video_path
 
